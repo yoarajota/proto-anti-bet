@@ -2,12 +2,14 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -19,6 +21,82 @@ const (
 	// The same default as tcpdump.
 	defaultSnapLen = 262144
 )
+
+var hostnameCache = make(map[string]string)
+var cacheMutex sync.RWMutex
+
+func extractSNI(data []byte) (string, bool) {
+	if len(data) < 43 {
+		return "", false
+	}
+
+	if data[0] != 0x16 {
+		return "", false
+	}
+
+	handshakeStart := 5
+	handshakeLen := int(data[3])<<8 | int(data[4])
+
+	if len(data) < handshakeStart+handshakeLen {
+		return "", false
+	}
+
+	offset := handshakeStart + 38
+
+	for offset+4 < len(data) {
+		extType := uint16(data[offset])<<8 | uint16(data[offset+1])
+		extLen := uint16(data[offset+2])<<8 | uint16(data[offset+3])
+
+		if extType == 0 && offset+int(extLen)+4 <= len(data) {
+			if data[offset+5] == 0 {
+				nameLen := uint16(data[offset+7])<<8 | uint16(data[offset+8])
+				if offset+9+int(nameLen) <= len(data) {
+					return string(data[offset+9 : offset+9+int(nameLen)]), true
+				}
+			}
+		}
+		offset += 4 + int(extLen)
+	}
+
+	return "", false
+}
+
+func reverseDNSLookup(ip string) string {
+	cacheMutex.RLock()
+
+	hostname, found := hostnameCache[ip]
+
+	if found {
+		cacheMutex.RUnlock()
+
+		return hostname
+	}
+
+	cacheMutex.RUnlock()
+
+	resultCh := make(chan string, 1)
+	go func() {
+		names, err := net.LookupAddr(ip)
+		if err != nil || len(names) == 0 {
+			resultCh <- ip
+
+			return
+		}
+
+		resultCh <- strings.TrimSuffix(names[0], ".")
+	}()
+
+	select {
+	case hostname := <-resultCh:
+		cacheMutex.Lock()
+		hostnameCache[ip] = hostname
+		cacheMutex.Unlock()
+
+		return hostname
+	case <-time.After(500 * time.Millisecond):
+		return ip
+	}
+}
 
 func amAdmin() bool {
 	_, err := os.Open("\\\\.\\PHYSICALDRIVE0")
@@ -58,7 +136,7 @@ func listenDevice(deviceName string, wg *sync.WaitGroup) {
 
 	// Filtrar tráfego HTTP (porta 80), HTTPS (porta 443), e também manter porta 3030
 	if err := handle.SetBPFFilter("tcp port 80 or tcp port 443 or port 3030"); err != nil {
-		fmt.Printf("Erro ao configurar filtro para %s: %v\n", deviceName, err)
+		fmt.Printf("Error in filter %s: %v\n", deviceName, err)
 		return
 	}
 
@@ -66,45 +144,65 @@ func listenDevice(deviceName string, wg *sync.WaitGroup) {
 	packetSource.DecodeOptions.Lazy = true
 	packetSource.DecodeOptions.NoCopy = true
 
-	fmt.Printf("Capturando pacotes HTTP em %s...\n", deviceName)
-
 	for packet := range packetSource.Packets() {
-		// Analisa apenas as camadas TCP que podem conter HTTP
+		ipLayer := packet.Layer(layers.LayerTypeIPv4)
 		tcpLayer := packet.Layer(layers.LayerTypeTCP)
-		if tcpLayer != nil {
+
+		if ipLayer != nil && tcpLayer != nil {
+			ip, _ := ipLayer.(*layers.IPv4)
 			tcp, _ := tcpLayer.(*layers.TCP)
 
-			// Verifica se é uma porta HTTP/HTTPS
-			isHTTP := tcp.SrcPort == 80 || tcp.DstPort == 80
 			isHTTPS := tcp.SrcPort == 443 || tcp.DstPort == 443
 
-			if isHTTP || isHTTPS {
-				applicationLayer := packet.ApplicationLayer()
-				if applicationLayer != nil {
-					payload := applicationLayer.Payload()
+			if isHTTPS {
+				var dstIP string
+				var hostname string
+				var found bool = false
 
-					// Protocolo
-					protocol := "HTTP"
-					if isHTTPS {
-						protocol = "HTTPS"
+				if tcp.DstPort == 443 {
+					dstIP = ip.DstIP.String()
+				} else {
+					dstIP = ip.SrcIP.String()
+				}
+
+				if tcp.DstPort == 443 {
+					payload := tcp.LayerPayload()
+
+					hostname, found := extractSNI(payload)
+
+					if found {
+						cacheMutex.RLock()
+						_, exists := hostnameCache[dstIP]
+						cacheMutex.RUnlock()
+
+						if !exists {
+							fmt.Printf("[%s] HTTPS connection %s (SNI) [%s]\n", deviceName, hostname, dstIP)
+
+							cacheMutex.Lock()
+							hostnameCache[dstIP] = hostname
+							cacheMutex.Unlock()
+						}
+
+						continue
 					}
+				}
 
-					// Verifica se parece ser um cabeçalho HTTP
-					payloadStr := string(payload)
-					if strings.Contains(payloadStr, "HTTP/1.") ||
-						strings.Contains(payloadStr, "GET ") ||
-						strings.Contains(payloadStr, "POST ") ||
-						strings.Contains(payloadStr, "Host:") {
+				_, exists := hostnameCache[dstIP]
 
-						fmt.Printf("\n[%s] %s Pacote capturado:\n", deviceName, protocol)
+				if !exists {
+					fmt.Printf("[%s] HTTPS connection %s (DNS) [%s]\n", deviceName, hostname, dstIP)
+				}
 
-						// Mostra as primeiras linhas (normalmente contém método, URL, etc)
-						lines := strings.Split(payloadStr, "\n")
-						for i, line := range lines {
-							if i > 10 || line == "" { // Limita a 10 linhas ou para na primeira linha vazia
-								break
-							}
-							fmt.Printf("  %s\n", strings.TrimSpace(line))
+				if tcp.DstPort != 443 || !found {
+					cacheMutex.RLock()
+					_, exists := hostnameCache[dstIP]
+					cacheMutex.RUnlock()
+
+					if !exists {
+						hostname = reverseDNSLookup(dstIP)
+
+						if hostname != dstIP {
+							fmt.Printf("[%s] HTTPS connection %s (DNS) [%s]\n", deviceName, hostname, dstIP)
 						}
 					}
 				}
